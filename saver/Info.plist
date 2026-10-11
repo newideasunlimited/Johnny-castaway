@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Johnny Castaway</string>
+	<key>CFBundleExecutable</key>
+	<string>JohnnyCastaway</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.newideasunlimited.JohnnyCastaway</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Johnny Castaway</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Engine: Johnny Reborn, GPL-3.0. Johnny Castaway artwork and data © 1992 Dynamix / Sierra On-Line.</string>
+	<key>NSPrincipalClass</key>
+	<string>JohnnyCastawayView</string>
+</dict>
+</plist>

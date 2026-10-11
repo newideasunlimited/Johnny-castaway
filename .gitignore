@@ -1,0 +1,5 @@
+build/
+data/*.zip
+data/*.part
+.DS_Store
+*.ppm

@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  headless:
+    name: Engine smoke test (Linux, headless)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch game data
+        run: sh scripts/fetch-data.sh data/scrantic_data.zip
+      - name: Build headless engine
+        run: make headless CC=gcc
+      - name: Run 600 frames at max speed
+        run: |
+          mkdir -p out
+          JC_REBORN_DATA=$PWD/data/scrantic_data.zip \
+          JC_HEADLESS_DIR=$PWD/out JC_HEADLESS_EVERY=100 \
+          ./build/jc_headless maxspeed nosound seed 7 frames 600 capture out/last.ppm
+          ls -l out
+          test -s out/last.ppm
+
+  saver:
+    name: Build JohnnyCastaway.saver (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch game data
+        run: sh scripts/fetch-data.sh data/scrantic_data.zip
+      - name: Build screen saver bundle
+        run: make saver
+      - name: Build windowed test app
+        run: make cli
+      - name: Inspect bundle
+        run: |
+          ls -R build/JohnnyCastaway.saver
+          file build/JohnnyCastaway.saver/Contents/MacOS/JohnnyCastaway
+          codesign -dv build/JohnnyCastaway.saver
+      - name: Zip bundle
+        run: |
+          cd build && ditto -c -k --keepParent JohnnyCastaway.saver JohnnyCastaway.saver.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JohnnyCastaway.saver
+          path: build/JohnnyCastaway.saver.zip
+          if-no-files-found: error
