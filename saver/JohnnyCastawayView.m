@@ -23,7 +23,7 @@
 static NSString * const kModuleName   = @"com.newideasunlimited.JohnnyCastaway";
 static NSString * const kPrefSound    = @"SoundEnabled";   /* BOOL */
 static NSString * const kPrefArtStyle = @"ArtStyle";       /* "hd" | "cartoon" */
-static NSString * const kPrefScaling  = @"Scaling";        /* "fit" | "integer" */
+static NSString * const kPrefScaling  = @"Scaling";        /* "extend" | "crop" | "stretch" | "fit" | "integer" */
 static NSString * const kPrefDayNight = @"DayNight";       /* "auto" | "day" | "night" */
 
 /* ── Process-wide engine state ───────────────────────────────────────────── */
@@ -143,6 +143,8 @@ static void engineStopAndWait(NSTimeInterval timeout)
     size_t    _frameCopyBytes;
     int       _frameWidth, _frameHeight, _framePitch;
     uint64_t  _drawnSerial;
+    NSInteger _hiddenFrames;
+    BOOL      _dismissed;
 }
 @property (nonatomic, strong) NSWindow      *configSheet;
 @property (nonatomic, strong) NSButton      *soundCheckbox;
@@ -159,7 +161,7 @@ static void engineStopAndWait(NSTimeInterval timeout)
     [defaults registerDefaults:@{
         kPrefSound:    @YES,
         kPrefArtStyle: @"hd",
-        kPrefScaling:  @"fit",
+        kPrefScaling:  @"extend",
         kPrefDayNight: @"auto",
     }];
     return defaults;
@@ -171,13 +173,52 @@ static void engineStopAndWait(NSTimeInterval timeout)
     if (self) {
         [self setAnimationTimeInterval:1.0 / 30.0];
         _drawnSerial = (uint64_t)-1;
+
+        /*  WHY THESE OBSERVERS EXIST. On macOS 14 and later the host process
+         *  (legacyScreenSaver) is not reliably told to stop when the screen
+         *  saver is dismissed: the window goes away but stopAnimation may
+         *  never arrive and the process lingers, so the engine kept running
+         *  and the sound effects kept playing over the desktop. The system
+         *  does post these distributed notifications, so they are the
+         *  trustworthy signal. */
+        if (!isPreview) {
+            NSDistributedNotificationCenter *center = [NSDistributedNotificationCenter defaultCenter];
+            [center addObserver:self selector:@selector(screenSaverWillStop:)
+                           name:@"com.apple.screensaver.willstop" object:nil];
+            [center addObserver:self selector:@selector(screenSaverWillStop:)
+                           name:@"com.apple.screensaver.didstop" object:nil];
+        }
     }
     return self;
 }
 
 - (void)dealloc
 {
+    [[NSDistributedNotificationCenter defaultCenter] removeObserver:self];
     free(_frameCopy);
+}
+
+/* ── Dismissal ─────────────────────────────────────────────────────────── */
+
+- (void)screenSaverWillStop:(NSNotification *)notification
+{
+    [self shutDownForDismissal];
+}
+
+/* Silence first, then stop the engine, then leave. Exiting the host process
+ * is deliberate: once the saver has been dismissed there is nothing left for
+ * legacyScreenSaver to do, and on macOS 14+ it would otherwise sit there with
+ * the engine thread alive. The system starts a fresh host next time. Never
+ * done for the System Settings preview, which must keep its process. */
+- (void)shutDownForDismissal
+{
+    if (_dismissed || [self isPreview]) return;
+    _dismissed = YES;
+
+    jcSaverSetMuted(1);
+    gActiveViews = 0;
+    engineStopAndWait(1.5);
+    exit(0);
 }
 
 - (BOOL)isOpaque { return YES; }
@@ -219,6 +260,7 @@ static void engineStopAndWait(NSTimeInterval timeout)
         setenv("JC_REBORN_DATA", zip.fileSystemRepresentation, 1);
     }
 
+    jcSaverSetMuted(0);
     engineStart([self engineArgs]);
 }
 
@@ -235,12 +277,27 @@ static void engineStopAndWait(NSTimeInterval timeout)
     gActiveViews--;
     if (gActiveViews <= 0) {
         gActiveViews = 0;
+        jcSaverSetMuted(1);
         engineStopAndWait(2.0);
     }
 }
 
 - (void)animateOneFrame
 {
+    /*  Fallback for a dismissal that posted no notification: a saver window
+     *  hidden for five seconds is not on anyone's screen, so go quiet and
+     *  stop the engine. Deliberately not an exit(): if the window ever comes
+     *  back the engine simply restarts, so a false reading costs nothing. */
+    if (![self isPreview] && self.window != nil) {
+        BOOL visible = ([self.window occlusionState] & NSWindowOcclusionStateVisible) != 0;
+        _hiddenFrames = visible ? 0 : _hiddenFrames + 1;
+        if (_hiddenFrames == 150) {
+            jcSaverSetMuted(1);
+            engineStopAndWait(0.5);
+        }
+        if (_hiddenFrames >= 150) return;
+    }
+
     [self ensureEngine];
     if (jcSaverFrameSerial() != _drawnSerial || jcSaverLastFatal() != NULL) {
         [self setNeedsDisplay:YES];
@@ -273,29 +330,51 @@ static void engineStopAndWait(NSTimeInterval timeout)
     return have;
 }
 
-- (NSRect)destinationRectForFrame
+- (NSString *)scalingMode
 {
-    NSRect bounds = [self bounds];
-    ScreenSaverDefaults *defaults = [[self class] defaults];
-    BOOL integer = [[defaults stringForKey:kPrefScaling] isEqualToString:@"integer"];
+    NSString *mode = [[[self class] defaults] stringForKey:kPrefScaling];
+    if ([mode isEqualToString:@"crop"] || [mode isEqualToString:@"stretch"] ||
+        [mode isEqualToString:@"fit"] || [mode isEqualToString:@"integer"])
+        return mode;
+    return @"extend";
+}
 
-    double scale = bounds.size.width / (double)_frameWidth;
+/* The engine renders 4:3. The screen almost never is, so the frame is
+ * placed according to the chosen mode:
+ *   extend   fit inside, then fill the bars with mirrored copies of the
+ *            frame's own edges (ocean and sky), so the picture reaches the
+ *            screen edges and nothing is cut off          (default)
+ *   crop     scale to cover the screen, trimming top and bottom
+ *   stretch  distort to the screen's aspect
+ *   fit      letterbox, black bars
+ *   integer  letterbox at a whole-number pixel scale (sharpest)
+ */
+- (NSRect)destinationRectForFrameInBounds:(NSRect)bounds mode:(NSString *)mode
+{
+    if ([mode isEqualToString:@"stretch"]) return bounds;
+
+    double scaleX = bounds.size.width / (double)_frameWidth;
     double scaleY = bounds.size.height / (double)_frameHeight;
-    if (scaleY < scale) scale = scaleY;
+    double scale;
 
-    if (integer && scale >= 1.0) {
-        /* Backing pixels, not points: on a Retina display a 2x view can show
-         * the 1280x960 render at an exact 1:1 or 2:1 pixel mapping. */
-        double backing = [self.window backingScaleFactor];
-        if (backing <= 0) backing = 1.0;
-        scale = floor(scale * backing) / backing;
-        if (scale < 1.0 / backing) scale = 1.0 / backing;
+    if ([mode isEqualToString:@"crop"]) {
+        scale = scaleX > scaleY ? scaleX : scaleY;
+    } else {
+        scale = scaleX < scaleY ? scaleX : scaleY;
+        if ([mode isEqualToString:@"integer"] && scale >= 1.0) {
+            /* Backing pixels, not points: on a Retina display a 2x view can
+             * show the 1280x960 render at an exact pixel mapping. */
+            double backing = [self.window backingScaleFactor];
+            if (backing <= 0) backing = 1.0;
+            scale = floor(scale * backing) / backing;
+            if (scale < 1.0 / backing) scale = 1.0 / backing;
+        }
     }
 
     double w = _frameWidth * scale;
     double h = _frameHeight * scale;
-    return NSMakeRect(floor((bounds.size.width - w) * 0.5),
-                      floor((bounds.size.height - h) * 0.5), w, h);
+    return NSMakeRect(floor(bounds.origin.x + (bounds.size.width - w) * 0.5),
+                      floor(bounds.origin.y + (bounds.size.height - h) * 0.5), w, h);
 }
 
 - (void)drawFrame
@@ -314,14 +393,56 @@ static void engineStopAndWait(NSTimeInterval timeout)
                                      (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
                                      provider, NULL, false, kCGRenderingIntentDefault);
 
-    NSRect dest = [self destinationRectForFrame];
+    NSRect bounds = [self bounds];
+    NSString *mode = [self scalingMode];
+    NSRect dest = [self destinationRectForFrameInBounds:bounds mode:mode];
+    CGRect cgDest = NSRectToCGRect(dest);
 
     /* The art is hard-edged pixel art: keep it crisp when enlarging, and only
      * smooth when shrinking (the System Settings preview). */
     double scale = dest.size.width / (double)_frameWidth;
     CGContextSetInterpolationQuality(context, scale >= 1.0 ? kCGInterpolationNone
                                                            : kCGInterpolationHigh);
-    CGContextDrawImage(context, NSRectToCGRect(dest), image);
+
+    CGContextSaveGState(context);
+    CGContextClipToRect(context, NSRectToCGRect(bounds));
+    CGContextDrawImage(context, cgDest, image);
+
+    if ([mode isEqualToString:@"extend"]) {
+        /* Mirror the frame into whichever bars remain. Horizontally mirrored
+         * copies sit to the left and right; vertically mirrored ones above
+         * and below (portrait screens). Each copy is the same frame drawn
+         * under a flipped transform, anchored so its edge meets ours. */
+        if (dest.origin.x > bounds.origin.x + 0.5 ||
+            NSMaxX(dest) < NSMaxX(bounds) - 0.5) {
+            CGContextSaveGState(context);
+            CGContextTranslateCTM(context, cgDest.origin.x, 0);
+            CGContextScaleCTM(context, -1, 1);
+            CGContextDrawImage(context, CGRectMake(0, cgDest.origin.y, cgDest.size.width, cgDest.size.height), image);
+            CGContextRestoreGState(context);
+
+            CGContextSaveGState(context);
+            CGContextTranslateCTM(context, cgDest.origin.x + 2 * cgDest.size.width, 0);
+            CGContextScaleCTM(context, -1, 1);
+            CGContextDrawImage(context, CGRectMake(0, cgDest.origin.y, cgDest.size.width, cgDest.size.height), image);
+            CGContextRestoreGState(context);
+        }
+        if (dest.origin.y > bounds.origin.y + 0.5 ||
+            NSMaxY(dest) < NSMaxY(bounds) - 0.5) {
+            CGContextSaveGState(context);
+            CGContextTranslateCTM(context, 0, cgDest.origin.y);
+            CGContextScaleCTM(context, 1, -1);
+            CGContextDrawImage(context, CGRectMake(cgDest.origin.x, 0, cgDest.size.width, cgDest.size.height), image);
+            CGContextRestoreGState(context);
+
+            CGContextSaveGState(context);
+            CGContextTranslateCTM(context, 0, cgDest.origin.y + 2 * cgDest.size.height);
+            CGContextScaleCTM(context, 1, -1);
+            CGContextDrawImage(context, CGRectMake(cgDest.origin.x, 0, cgDest.size.width, cgDest.size.height), image);
+            CGContextRestoreGState(context);
+        }
+    }
+    CGContextRestoreGState(context);
 
     CGImageRelease(image);
     CGDataProviderRelease(provider);
@@ -365,7 +486,7 @@ static void engineStopAndWait(NSTimeInterval timeout)
 
 - (NSPopUpButton *)popupWithTitles:(NSArray<NSString *> *)titles y:(CGFloat)y
 {
-    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, y, 210, 26) pullsDown:NO];
+    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, y, 290, 26) pullsDown:NO];
     [popup addItemsWithTitles:titles];
     [self.configSheet.contentView addSubview:popup];
     return popup;
@@ -386,7 +507,7 @@ static void engineStopAndWait(NSTimeInterval timeout)
         return self.configSheet;
     }
 
-    NSRect frame = NSMakeRect(0, 0, 380, 236);
+    NSRect frame = NSMakeRect(0, 0, 460, 236);
     self.configSheet = [[NSWindow alloc] initWithContentRect:frame
                                                    styleMask:NSWindowStyleMaskTitled
                                                      backing:NSBackingStoreBuffered
@@ -395,7 +516,7 @@ static void engineStopAndWait(NSTimeInterval timeout)
 
     NSTextField *heading = [NSTextField labelWithString:@"Johnny Castaway"];
     [heading setFont:[NSFont boldSystemFontOfSize:15]];
-    [heading setFrame:NSMakeRect(20, 198, 340, 22)];
+    [heading setFrame:NSMakeRect(20, 198, 420, 22)];
     [self.configSheet.contentView addSubview:heading];
 
     [self addLabel:@"Artwork:" y:156];
@@ -405,24 +526,34 @@ static void engineStopAndWait(NSTimeInterval timeout)
     self.dayNightPopup = [self popupWithTitles:@[@"Follow the clock", @"Always day", @"Always night"] y:122];
 
     [self addLabel:@"Scaling:" y:88];
-    self.scalingPopup = [self popupWithTitles:@[@"Fill the screen", @"Integer scale (sharpest)"] y:88];
+    self.scalingPopup = [self popupWithTitles:@[@"Fill screen, extend ocean and sky",
+                                                @"Fill screen, crop top and bottom",
+                                                @"Stretch to fill",
+                                                @"Fit with black bars",
+                                                @"Integer scale (sharpest, bars)"] y:88];
 
     self.soundCheckbox = [NSButton checkboxWithTitle:@"Play sound effects" target:nil action:NULL];
-    [self.soundCheckbox setFrame:NSMakeRect(150, 56, 210, 20)];
+    [self.soundCheckbox setFrame:NSMakeRect(150, 56, 290, 20)];
     [self.configSheet.contentView addSubview:self.soundCheckbox];
 
     NSButton *cancel = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(configCancel:)];
-    [cancel setFrame:NSMakeRect(190, 14, 84, 32)];
+    [cancel setFrame:NSMakeRect(270, 14, 84, 32)];
     [cancel setKeyEquivalent:@"\033"];
     [self.configSheet.contentView addSubview:cancel];
 
     NSButton *ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(configOK:)];
-    [ok setFrame:NSMakeRect(278, 14, 84, 32)];
+    [ok setFrame:NSMakeRect(358, 14, 84, 32)];
     [ok setKeyEquivalent:@"\r"];
     [self.configSheet.contentView addSubview:ok];
 
     [self loadConfigSheetValues];
     return self.configSheet;
+}
+
+/* Same order as the Scaling popup. */
+- (NSArray<NSString *> *)scalingModes
+{
+    return @[@"extend", @"crop", @"stretch", @"fit", @"integer"];
 }
 
 - (void)loadConfigSheetValues
@@ -433,8 +564,8 @@ static void engineStopAndWait(NSTimeInterval timeout)
     NSString *dayNight = [defaults stringForKey:kPrefDayNight];
     [self.dayNightPopup selectItemAtIndex:
         [dayNight isEqualToString:@"day"] ? 1 : [dayNight isEqualToString:@"night"] ? 2 : 0];
-    [self.scalingPopup selectItemAtIndex:
-        [[defaults stringForKey:kPrefScaling] isEqualToString:@"integer"] ? 1 : 0];
+    NSUInteger scalingIndex = [[self scalingModes] indexOfObject:[self scalingMode]];
+    [self.scalingPopup selectItemAtIndex:(scalingIndex == NSNotFound ? 0 : (NSInteger)scalingIndex)];
     [self.soundCheckbox setState:[defaults boolForKey:kPrefSound] ? NSControlStateValueOn
                                                                   : NSControlStateValueOff];
 }
@@ -464,8 +595,9 @@ static void engineStopAndWait(NSTimeInterval timeout)
     NSArray *dayNight = @[@"auto", @"day", @"night"];
     NSInteger dn = [self.dayNightPopup indexOfSelectedItem];
     [defaults setObject:dayNight[(dn >= 0 && dn < 3) ? dn : 0] forKey:kPrefDayNight];
-    [defaults setObject:([self.scalingPopup indexOfSelectedItem] == 1 ? @"integer" : @"fit")
-                 forKey:kPrefScaling];
+    NSInteger sc = [self.scalingPopup indexOfSelectedItem];
+    NSArray *modes = [self scalingModes];
+    [defaults setObject:modes[(sc >= 0 && sc < (NSInteger)modes.count) ? sc : 0] forKey:kPrefScaling];
     [defaults setBool:([self.soundCheckbox state] == NSControlStateValueOn) forKey:kPrefSound];
     [defaults synchronize];
 

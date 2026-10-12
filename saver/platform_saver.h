@@ -34,6 +34,12 @@ void jcSaverRequestQuit(void);
 void jcSaverClearQuit(void);
 int  jcSaverQuitRequested(void);
 
+/* Silence the audio output immediately, from any thread, without waiting for
+ * the engine to notice a quit request. The engine's own sound logic keeps
+ * running; the audio callback just emits silence while muted. Cleared by the
+ * host before each engine start. */
+void jcSaverSetMuted(int muted);
+
 /* Front buffer access. jcSaverLockFrame() returns 1 and fills *frame when a
  * frame has been presented since the process started; the lock is held until
  * jcSaverUnlockFrame(), so copy quickly and unlock. */

@@ -56,8 +56,11 @@ Click **Options…** under the preview:
   back to HD for scenes it does not cover yet.
 - **Time of day**: follow the clock (night backdrop from 21:00 to 05:59, as
   the original did), or force day or night.
-- **Scaling**: fill the screen while keeping the 4:3 aspect, or use only
-  whole-number scale factors for the sharpest pixels.
+- **Scaling**: the original is 4:3 and your screen is not. The default
+  fills the screen by mirroring the ocean and sky into the space at the
+  sides, so nothing is cut off and there are no black bars. The other
+  choices crop the top and bottom, stretch, letterbox, or letterbox at a
+  whole-number pixel scale for the sharpest picture.
 - **Play sound effects**: the original samples, through Core Audio. The
   System Settings preview is always silent.
 
@@ -105,6 +108,13 @@ tools/platform_headless.c    a backend with no display, used by CI and for
                              were made with it on Linux)
 scripts/fetch-data.sh        downloads and verifies scrantic_data.zip
 ```
+
+When the saver is dismissed the sound is muted at once, the engine is asked
+to quit, and the host process exits. The last step matters on macOS 14 and
+later, where the system's `legacyScreenSaver` host is not reliably told to
+stop and would otherwise keep the engine (and its sound effects) running in
+the background; the system's own "screen saver did stop" notification is
+used as the trigger, with a hidden-window check as a fallback.
 
 The engine is a single-instance C program, so one engine runs per process
 and every `ScreenSaverView` (one per display, plus the System Settings

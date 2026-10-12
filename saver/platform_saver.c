@@ -46,12 +46,14 @@ static volatile uint64_t frameSerial = 0;
 /* ── Host control ────────────────────────────────────────────────────────── */
 
 static volatile int quitRequested = 0;
+static volatile int audioMuted = 0;
 static volatile int lastExitCode = 0;
 static pthread_mutex_t fatalMutex = PTHREAD_MUTEX_INITIALIZER;
 static char fatalText[1024];
 static int haveFatal = 0;
 
 void jcSaverRequestQuit(void) { quitRequested = 1; }
+void jcSaverSetMuted(int muted) { audioMuted = muted ? 1 : 0; }
 void jcSaverClearQuit(void) { quitRequested = 0; }
 int  jcSaverQuitRequested(void) { return quitRequested; }
 
@@ -197,7 +199,10 @@ static pthread_mutex_t audioMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void audioOutputCallback(void* userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
     UNUSED(userData);
-    if (audioCallback) {
+    if (audioMuted) {
+        /* Dismissed: the host wants silence NOW, whatever the engine is doing. */
+        memset(buffer->mAudioData, 128, buffer->mAudioDataBytesCapacity);
+    } else if (audioCallback) {
         audioCallback(audioUserData, (uint8*)buffer->mAudioData, (int)buffer->mAudioDataBytesCapacity);
     } else {
         memset(buffer->mAudioData, 128, buffer->mAudioDataBytesCapacity);
